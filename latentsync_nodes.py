@@ -33,6 +33,10 @@ class LatentSyncNode:
                     "INT",
                     {"default": 1247, "min": 0, "max": 0xFFFFFFFFFFFFFFFF},
                 ),  # 更好的随机种子范围
+                "sync_frames": (
+                    "INT",
+                    {"default": 16, "min": 2, "max": 30, "step": 2},
+                ),  # 同步间隔帧数
                 "guidance_scale": (
                     "FLOAT",
                     {"default": 2, "min": 1.0, "max": 3.0, "step": 0.1},
@@ -52,7 +56,7 @@ class LatentSyncNode:
 
     # 移除未使用的 process_batch 方法
 
-    def inference(self, IMAGE, AUDIO, seed, guidance_scale=1.5, inference_steps=20):
+    def inference(self, IMAGE, AUDIO, seed, sync_frames, guidance_scale=1.5, inference_steps=20):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         is_fp16_supported = (
             torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7
@@ -141,7 +145,7 @@ class LatentSyncNode:
             video_frames_uint8_np=IMAGE,
             audio_waveform_float_tensor=waveform_cpu,
             audio_sample_rate=target_sample_rate,
-            num_frames=config.data.num_frames,
+            num_frames=sync_frames,
             video_fps=config.data.video_fps,
             num_inference_steps=inference_steps,
             guidance_scale=guidance_scale,
@@ -260,6 +264,10 @@ class SaveLipSyncVideo:
                     "INT",
                     {"default": 9, "min": 1, "max": 30, "step": 1},
                 ),  # CRF for libx264/libx265 (lower is better quality, larger file)
+                "codec": (
+                    ["libx264", "libx265"],
+                    {"default": "libx265"},
+                ),
                 "audio_bitrate": (
                     ["192k", "256k", "384k", "512k"],
                     {"default": "384k"},
@@ -272,7 +280,7 @@ class SaveLipSyncVideo:
     OUTPUT_NODE = True
     CATEGORY = "LatentSync"
 
-    def merge_video(self, IMAGE, AUDIO, filename_prefix, fps, quality, audio_bitrate):
+    def merge_video(self, IMAGE, AUDIO, filename_prefix, fps, quality, codec, audio_bitrate):
         output_dir = folder_paths.get_output_directory()
         temp_dir = tempfile.mkdtemp(
             prefix="comfyui_imgio_temp_", dir=folder_paths.get_temp_directory()
@@ -293,7 +301,7 @@ class SaveLipSyncVideo:
             with imageio.get_writer(
                 silent_video_path,
                 fps=fps,
-                codec="libx265",
+                codec=codec,
                 quality=None,
                 pixelformat="rgb24",
                 macro_block_size=None,
