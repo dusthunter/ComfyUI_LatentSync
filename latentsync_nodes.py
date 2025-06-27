@@ -45,6 +45,10 @@ class LatentSyncNode:
                     "INT",
                     {"default": 25, "min": 1, "max": 100, "step": 1},
                 ),  # 常用范围
+                "face_detect_once": (
+                    "BOOLEAN",
+                    {"default": True},
+                ),  # 新增参数：是否只进行一次人脸检测
             }
         }
 
@@ -56,7 +60,7 @@ class LatentSyncNode:
 
     # 移除未使用的 process_batch 方法
 
-    def inference(self, IMAGE, AUDIO, seed, sync_frames, guidance_scale=1.5, inference_steps=20):
+    def inference(self, IMAGE, AUDIO, seed, sync_frames, guidance_scale=1.5, inference_steps=20, face_detect_once=True):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         is_fp16_supported = (
             torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7
@@ -153,6 +157,7 @@ class LatentSyncNode:
             width=config.data.resolution,
             height=config.data.resolution,
             mask_image_path=os.path.join(BASE_DIR,config.data.mask_image_path),
+            face_detect_once=face_detect_once,  # 新增参数传递
         )
 
 

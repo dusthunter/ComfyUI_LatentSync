@@ -310,6 +310,69 @@ class LipsyncPipeline(DiffusionPipeline):
             faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
 
         return video_frames, faces, boxes, affine_matrices
+    
+    def loop_video_fix(self, whisper_chunks: list, video_frames: np.ndarray):
+        num_required_frames = len(whisper_chunks)
+        num_video_frames = len(video_frames)
+    
+        # 1. Loop video frames if audio is longer. This logic is unchanged.
+        if num_required_frames > num_video_frames:
+            print(f"Audio is longer than video. Looping video to match {num_required_frames} frames.")
+            num_loops = math.ceil(num_required_frames / num_video_frames)
+            looped_video_frames = []
+            for i in range(num_loops):
+                looped_video_frames.append(video_frames if i % 2 == 0 else video_frames[::-1])
+            video_frames = np.concatenate(looped_video_frames, axis=0)
+        
+        video_frames = video_frames[:num_required_frames]
+    
+        # 2. Establish the STABLE geometric reference from the first frame.
+        print("Analyzing the first frame to establish a stable landmark reference...")
+        first_frame = video_frames[0]
+        
+        # Run face detection ONCE to get stable landmarks.
+        _, landmark_2d_106 = self.image_processor.face_detector(first_frame)
+        if landmark_2d_106 is None:
+            raise RuntimeError("Face not detected in the first frame. Cannot proceed.")
+        
+        # Calculate the stable eye and nose anchor points ONCE.
+        pt_left_eye = np.mean(landmark_2d_106[[43, 48, 49, 51, 50]], axis=0)
+        pt_right_eye = np.mean(landmark_2d_106[101:106], axis=0)
+        pt_nose = np.mean(landmark_2d_106[[74, 77, 83, 86]], axis=0)
+        stable_landmarks3 = np.round([pt_left_eye, pt_right_eye, pt_nose])
+    
+        # 3. Process all frames using the stable landmark reference.
+        print(f"Applying transformation to all {len(video_frames)} frames using the stable reference...")
+        faces = []
+        boxes = []
+        affine_matrices = []
+    
+        for frame in tqdm.tqdm(video_frames, desc="Applying stable transform"):
+            # For each frame, we now execute the exact logic from the original `affine_transform` function,
+            # but we inject our `stable_landmarks3`.
+            
+            # --- Start: Exact copy of the original `affine_transform` logic ---
+            
+            # Use the CURRENT frame's pixels, but the FIRST frame's landmarks.
+            face, affine_matrix = self.image_processor.restorer.align_warp_face(
+                frame.copy(), landmarks3=stable_landmarks3, smooth=True
+            )
+            
+            # The rest of the original logic remains identical.
+            box = [0, 0, face.shape[1], face.shape[0]]
+            face = cv2.resize(face, (self.image_processor.resolution, self.image_processor.resolution), interpolation=cv2.INTER_LANCZOS4)
+            face_tensor = rearrange(torch.from_numpy(face), "h w c -> c h w")
+            
+            # --- End: Exact copy of the original `affine_transform` logic ---
+            
+            # Append the results from this frame to our lists.
+            faces.append(face_tensor)
+            boxes.append(box)
+            affine_matrices.append(affine_matrix)
+            
+        faces = torch.stack(faces)
+    
+        return video_frames, faces, boxes, affine_matrices
 
     @torch.no_grad()
     def __call__(
@@ -332,6 +395,7 @@ class LipsyncPipeline(DiffusionPipeline):
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
+        face_detect_once: bool = True,  # 新增参数，默认True
         **kwargs,
     ):
         is_train = self.denoising_unet.training
@@ -378,7 +442,11 @@ class LipsyncPipeline(DiffusionPipeline):
         # video_frames = read_video(video_path, use_decord=False)
         video_frames = video_frames_uint8_np # Use the input numpy array directly
 
-        video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
+        # 根据 face_detect_once 参数选择不同的对齐方式
+        if face_detect_once:
+            video_frames, faces, boxes, affine_matrices = self.loop_video_fix(whisper_chunks, video_frames)
+        else:
+            video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
 
         synced_video_frames = []
 
