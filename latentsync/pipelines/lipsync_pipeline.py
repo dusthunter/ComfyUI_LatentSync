@@ -311,11 +311,32 @@ class LipsyncPipeline(DiffusionPipeline):
 
         return video_frames, faces, boxes, affine_matrices
     
-    def loop_video_fix(self, whisper_chunks: list, video_frames: np.ndarray):
+
+
+    # 假设这个函数是某个类的一部分 (e.g., class VideoProcessor)
+    # 并且在 __init__ 中设置了 self.movement_threshold = 5.0  # 像素距离阈值
+    def loop_video_fix(self, whisper_chunks: list, video_frames: np.ndarray, movement_threshold):
+        """
+        通过带阈值的自适应地标更新策略来处理视频，兼顾稳定性和适应性。
+
+        - 策略:
+          1. 首先将视频循环到所需长度。
+          2. 初始化一个“活动地标”(active_landmarks)为第一帧的地标。
+          3. 逐帧处理：
+             a. 检测当前帧的地标。
+             b. 计算当前地标与“活动地标”的平均距离。
+             c. 如果距离大于设定的阈值 (movement_threshold)，则更新“活动地标”为当前帧的地标。
+             d. 否则，继续使用旧的“活动地标”。
+          4. 使用最终确定的“活动地标”对当前帧进行对齐变换。
+
+        - 优点:
+          - 过滤了微小的检测误差导致的画面抖动。
+          - 当头部发生真实、显著的移动时，能够平滑地更新参考点，避免嘴部错位。
+        """
         num_required_frames = len(whisper_chunks)
         num_video_frames = len(video_frames)
-    
-        # 1. Loop video frames if audio is longer. This logic is unchanged.
+
+        # 1. 循环视频帧以匹配音频长度 (与 loop_video_fix 相同)
         if num_required_frames > num_video_frames:
             print(f"Audio is longer than video. Looping video to match {num_required_frames} frames.")
             num_loops = math.ceil(num_required_frames / num_video_frames)
@@ -323,55 +344,69 @@ class LipsyncPipeline(DiffusionPipeline):
             for i in range(num_loops):
                 looped_video_frames.append(video_frames if i % 2 == 0 else video_frames[::-1])
             video_frames = np.concatenate(looped_video_frames, axis=0)
-        
+
         video_frames = video_frames[:num_required_frames]
-    
-        # 2. Establish the STABLE geometric reference from the first frame.
-        print("Analyzing the first frame to establish a stable landmark reference...")
-        first_frame = video_frames[0]
-        
-        # Run face detection ONCE to get stable landmarks.
-        _, landmark_2d_106 = self.image_processor.face_detector(first_frame)
-        if landmark_2d_106 is None:
-            raise RuntimeError("Face not detected in the first frame. Cannot proceed.")
-        
-        # Calculate the stable eye and nose anchor points ONCE.
-        pt_left_eye = np.mean(landmark_2d_106[[43, 48, 49, 51, 50]], axis=0)
-        pt_right_eye = np.mean(landmark_2d_106[101:106], axis=0)
-        pt_nose = np.mean(landmark_2d_106[[74, 77, 83, 86]], axis=0)
-        stable_landmarks3 = np.round([pt_left_eye, pt_right_eye, pt_nose])
-    
-        # 3. Process all frames using the stable landmark reference.
-        print(f"Applying transformation to all {len(video_frames)} frames using the stable reference...")
+
+        # 2. 初始化处理列表和“活动地标”
+        print("Processing frames with adaptive landmark update strategy...")
         faces = []
         boxes = []
         affine_matrices = []
-    
-        for frame in tqdm.tqdm(video_frames, desc="Applying stable transform"):
-            # For each frame, we now execute the exact logic from the original `affine_transform` function,
-            # but we inject our `stable_landmarks3`.
-            
-            # --- Start: Exact copy of the original `affine_transform` logic ---
-            
-            # Use the CURRENT frame's pixels, but the FIRST frame's landmarks.
+
+        active_landmarks3 = None # 当前生效的稳定地标
+
+        # 一个辅助函数，用于从106点地标计算3个关键点
+        def get_3_key_landmarks(landmark_2d_106):
+            pt_left_eye = np.mean(landmark_2d_106[[43, 48, 49, 51, 50]], axis=0)
+            pt_right_eye = np.mean(landmark_2d_106[101:106], axis=0)
+            pt_nose = np.mean(landmark_2d_106[[74, 77, 83, 86]], axis=0)
+            return np.round([pt_left_eye, pt_right_eye, pt_nose])
+
+        # 3. 逐帧处理，并根据阈值自适应更新地标
+        for i, frame in enumerate(tqdm.tqdm(video_frames, desc="Applying adaptive transform")):
+            # a. 检测当前帧的地标
+            _, current_landmarks_2d_106 = self.image_processor.face_detector(frame)
+
+            if current_landmarks_2d_106 is not None:
+                current_landmarks3 = get_3_key_landmarks(current_landmarks_2d_106)
+
+                # 如果是第一帧或第一个成功检测到地标的帧，直接初始化
+                if active_landmarks3 is None:
+                    active_landmarks3 = current_landmarks3
+                    print(f"Initialized landmark reference at frame {i}.")
+                else:
+                    # b. 计算当前地标与“活动地标”的距离
+                    # 使用欧几里得范数计算每个点的距离，然后取平均值
+                    dist_eye1 = np.linalg.norm(current_landmarks3[0] - active_landmarks3[0])
+                    dist_eye2 = np.linalg.norm(current_landmarks3[1] - active_landmarks3[1])
+                    dist_nose = np.linalg.norm(current_landmarks3[2] - active_landmarks3[2])
+                    avg_dist = (dist_eye1 + dist_eye2 + dist_nose) / 3.0
+
+                    # c. 如果距离大于阈值，则更新“活动地标”
+                    if avg_dist > movement_threshold:
+                        active_landmarks3 = current_landmarks3
+                        # print(f"Landmark reference updated at frame {i} (movement: {avg_dist:.2f} pixels).")
+
+            # 如果当前帧未检测到人脸，就必须依赖之前已有的 'active_landmarks3'
+            if active_landmarks3 is None:
+                # 如果在处理了多帧后仍然没有找到任何一个基准，则无法继续
+                raise RuntimeError(f"Face not detected in the first {i+1} frames. Cannot establish a landmark reference.")
+
+            # d. 使用最终确定的“活动地标”进行对齐变换
             face, affine_matrix = self.image_processor.restorer.align_warp_face(
-                frame.copy(), landmarks3=stable_landmarks3, smooth=True
+                frame.copy(), landmarks3=active_landmarks3, smooth=True
             )
-            
-            # The rest of the original logic remains identical.
+
             box = [0, 0, face.shape[1], face.shape[0]]
             face = cv2.resize(face, (self.image_processor.resolution, self.image_processor.resolution), interpolation=cv2.INTER_LANCZOS4)
             face_tensor = rearrange(torch.from_numpy(face), "h w c -> c h w")
-            
-            # --- End: Exact copy of the original `affine_transform` logic ---
-            
-            # Append the results from this frame to our lists.
+
             faces.append(face_tensor)
             boxes.append(box)
             affine_matrices.append(affine_matrix)
-            
+
         faces = torch.stack(faces)
-    
+
         return video_frames, faces, boxes, affine_matrices
 
     @torch.no_grad()
@@ -396,6 +431,7 @@ class LipsyncPipeline(DiffusionPipeline):
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
         face_detect_once: bool = True,  # 新增参数，默认True
+        movement_threshold: float = 5.0,  # 新增参数，像素距离阈值
         **kwargs,
     ):
         is_train = self.denoising_unet.training
@@ -444,7 +480,7 @@ class LipsyncPipeline(DiffusionPipeline):
 
         # 根据 face_detect_once 参数选择不同的对齐方式
         if face_detect_once:
-            video_frames, faces, boxes, affine_matrices = self.loop_video_fix(whisper_chunks, video_frames)
+            video_frames, faces, boxes, affine_matrices = self.loop_video_fix(whisper_chunks, video_frames, movement_threshold)
         else:
             video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
 
